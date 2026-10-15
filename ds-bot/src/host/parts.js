@@ -300,7 +300,10 @@ export function install(rt) {
         if (line.who === 'you') continue
         const text = clip(line.text, LIST_LINE_MAX, `read_own_chat around "part ${number} #${line.seq}" shows all of it`)
         const cost = estimateTokens(text)
-        if (unlisted > 0 || listed + cost > LIST_TOKENS) {
+        // A3: earlier-list budget scales with the recent budget (already scaled
+        // by check/4 in the caller), so the whole handoff package fits small windows.
+        const earlierBudget = Math.min(LIST_TOKENS, Math.floor(budget / 4))
+        if (unlisted > 0 || listed + cost > earlierBudget) {
           unlisted += 1
           continue
         }
@@ -358,6 +361,11 @@ export function install(rt) {
     const header = session.requestHeader()
     const route = header?.config
     if (!route?.provider || !route?.model) throw new Error('the Session has not called a model yet')
+    // A3: scale the note budget by the check line. A fixed 8192-token note alone
+    // exceeds the hard line on a small (8k/32k) window, so the fresh part is born
+    // past hard and switches again immediately.
+    const noteLines = await contextLines(session).catch(() => undefined)
+    const noteMax = noteLines ? Math.max(1024, Math.min(NOTE_MAX_TOKENS, Math.floor(noteLines.check / 4))) : NOTE_MAX_TOKENS
     const messages = session.deriveMessages()
     const base = folder ? FOLDER_PROMPT : HANDOFF_PROMPT
     let retry
@@ -372,7 +380,7 @@ export function install(rt) {
         messages: [...messages, { role: 'user', content: [{ type: 'text', text: prompt }] }],
         toolHistory: session.toolHistory(),
         ...(header.tools ? { tools: [...header.tools] } : {}),
-        maxTokens: Math.min(NOTE_MAX_TOKENS, route.maxTokens ?? NOTE_MAX_TOKENS),
+        maxTokens: Math.min(noteMax, route.maxTokens ?? noteMax),
         sessionId: session.id,
         purpose: 'compaction',
         signal,
@@ -503,18 +511,28 @@ export function install(rt) {
     return parseDecision(assembler.blocks().filter(block => block.type === 'text').map(block => block.text).join('\n'))
   }
 
-  // What the steward decides; a part that cannot be condensed, or a steward that
-  // gives no answer, moves on as it always could.
+  // What the steward decides.
+  // - A pending ask_user question means the work is still under way (the steward
+  //   prompt says so: an unanswered question => compact). Do not call the steward
+  //   and never switch away from a question the user has not answered; the fresh
+  //   part would just ask it again and switch again.
+  // - A steward that fails (quota / network / no usable answer) must NOT default
+  //   to 'switch'. The handoff-note call uses the same model and will fail the same
+  //   way, so 'switch' on steward failure is the segment loop: switch -> note fails ->
+  //   fallback note -> new part still past the line -> switch again. Default to
+  //   'compact' (stay in place, retry later with cooldown); only a part that cannot
+  //   be condensed at all (no engine) moves on.
   async function decide(agent, { midTurn }) {
     if (engineOf(agent) === undefined) return 'switch'
+    if (state.questions?.[agent.id] !== undefined) return 'compact'
     try {
       const action = await askSteward(agent, { midTurn })
       if (action !== undefined) return action
-      rt.warn('ds-bot: the context steward gave no usable answer for %s; moving on to a fresh part', agent.id)
+      rt.warn('ds-bot: the context steward gave no usable answer for %s; staying in place instead of switching', agent.id)
     } catch (error) {
-      rt.warn('ds-bot: the context steward failed for %s; moving on to a fresh part: %s', agent.id, error)
+      rt.warn('ds-bot: the context steward failed for %s; staying in place instead of switching: %s', agent.id, error)
     }
-    return 'switch'
+    return 'compact'
   }
 
   // Condenses the part through its own backend. `inTurn`: before a step of a running
@@ -838,11 +856,22 @@ export function install(rt) {
     if (fresh !== undefined) {
       freshParts.delete(agent.id)
       partBase.set(agent.id, (tokensOf(agent.session) ?? 0) + fresh)
+    } else if (!partBase.has(agent.id)) {
+      // First sight after a restart: partBase / freshParts / cooldowns are
+      // in-memory only and were lost. Without a baseline, grown() treats the
+      // current tokens (system prompt + handoff package alone) as growth and
+      // the part switches immediately, then again after every restart. Treat
+      // the current size as the baseline and do not switch on this turn.
+      const now = tokensOf(agent.session)
+      if (now !== undefined) partBase.set(agent.id, now)
     }
     if (!readOnly() && await folderMove(agent, { midTurn: payload.step > 1 }) !== undefined) return switchBeforeStep(agent, payload, { folder: true })
     const lines = await contextLines(agent.session).catch(() => undefined)
     const tokens = tokensOf(agent.session)
-    if (lines === undefined || tokens === undefined || tokens < lines.hard || !grown(agent.id, tokens, lines) || readOnly()) return next()
+    // A1: past the hard line, act even without grown() (hard means near the
+    // window; waiting for check/4 more growth would overflow first). Below hard,
+    // grown() still gates. Paired with A3 so the fresh part is born below hard.
+    if (lines === undefined || tokens === undefined || tokens < lines.hard || readOnly()) return next()
     if (await decide(agent, { midTurn: payload.step > 1 }) === 'compact' && await condense(agent, lines, { inTurn: true, signal: payload.signal })) return next()
     return switchBeforeStep(agent, payload, { hard: true })
   }, { prepend: true })
@@ -910,10 +939,13 @@ export function install(rt) {
     if (payload.failure?.code !== OVERFLOW || payload.signal?.aborted) return next()
     await rt.load()
     const { agent } = payload
-    if (!rt.isBotSession(agent.id) || switches.has(agent.id) || readOnly()) return next()
+    // A2: same bare guard as the STUCK handler. A bare-rescued part (latest
+    // messages themselves break every request) must reach the terminal state,
+    // not reset to 'carried' and loop forever.
+    if (!rt.isBotSession(agent.id) || switches.has(agent.id) || readOnly() || rescued.get(agent.id) === 'bare') return next()
     const entry = rt.liveOf(agent.id)
     entry.switched = true
-    startSwitch(agent, { resume: true, info: entry.info, joined: [...(entry.joined ?? [])], overflow: true })
+    startSwitch(agent, { resume: true, info: entry.info, joined: [...(entry.joined ?? [])], overflow: true, bare: rescued.get(agent.id) === 'carried' })
     return undefined
   }, { prepend: true })
 
@@ -922,16 +954,35 @@ export function install(rt) {
   // past it.
   async function checkContext(agent) {
     if (switches.has(agent.id) || freshParts.has(agent.id) || checking.has(agent.id) || readOnly()) return
+    checking.add(agent.id)
     const lines = await contextLines(agent.session)
     const tokens = tokensOf(agent.session)
-    if (lines === undefined || tokens === undefined || tokens < lines.check || !grown(agent.id, tokens, lines)) return
+    if (lines === undefined || tokens === undefined) { checking.delete(agent.id); return }
+    if (!partBase.has(agent.id)) {
+      // First check after a restart: see the pre-step baseline comment. Do not
+      // switch on a size that predates this process.
+      partBase.set(agent.id, tokens)
+      checking.delete(agent.id)
+      return
+    }
+    if (tokens < lines.check || (tokens < lines.hard && !grown(agent.id, tokens, lines))) { checking.delete(agent.id); return }
     const hard = tokens >= lines.hard
-    if (!hard && Date.now() < (noteFailures.get(agent.id)?.until ?? 0)) return
-    checking.add(agent.id)
+    if (!hard && Date.now() < (noteFailures.get(agent.id)?.until ?? 0)) { checking.delete(agent.id); return }
     try {
       if (await decide(agent, { midTurn: false }) === 'compact') {
         const condensed = await condense(agent, lines, { inTurn: false })
         if (condensed !== false) return
+        // Condense failed (e.g. the same quota error that broke the steward).
+        // Below the hard line, staying is safe and switching is not: the fresh
+        // part would open with the same oversized handoff and switch again.
+        // Only past the hard line does a failed condense still move on.
+        if (tokens < lines.hard) {
+          const count = (noteFailures.get(agent.id)?.count ?? 0) + 1
+          const wait = NOTE_COOLDOWN_MS[Math.min(count, NOTE_COOLDOWN_MS.length) - 1]
+          noteFailures.set(agent.id, { count, until: Date.now() + wait })
+          rt.warn('ds-bot: condensing %s failed below the hard line; staying in place, next try in %ds', agent.id, wait / 1000)
+          return
+        }
       }
       if (switches.has(agent.id)) return
       startSwitch(agent, { hard: (tokensOf(agent.session) ?? tokens) >= lines.hard })

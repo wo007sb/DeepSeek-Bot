@@ -684,6 +684,13 @@ export function install(rt) {
   // chaining another handoff part.
   const overflowStreak = new Map()
   const overflowUserCount = new Map()
+  // Batch5 (Doubao log): moveOn can fail with "cannot get required service
+  // sessionController in inactive context". The old code treated that as
+  // "not done, try again", so checkContext/pre-step retried every ~20-30s,
+  // each retry rewriting a note (~128K tokens) and opening another part.
+  // An inactive-context failure must cool down, not retry immediately.
+  const inactiveUntil = new Map()
+  const INACTIVE_COOLDOWN_MS = 600_000
   // Parts whose note failed below the hard line: failures in a row, and the time
   // before which the check line does not try again.
   const noteFailures = new Map()
@@ -725,7 +732,14 @@ export function install(rt) {
     const job = { ...place, carry: [...carry], info, joined, resume, overflow, failed, bare, folder, hard, since: Date.now() }
     switches.set(agent.id, job)
     void runSwitch(agent, job)
-      .catch(error => rt.warn('ds-bot: %s did not move on to a fresh part: %s', rt.botOf(job.botId)?.name ?? agent.id, error))
+      .catch(error => {
+        rt.warn('ds-bot: %s did not move on to a fresh part: %s', rt.botOf(job.botId)?.name ?? agent.id, error)
+        // Batch5: inactive-context failure => cool down, do not retry at once.
+        if (String(error?.message ?? error).includes('inactive')) {
+          inactiveUntil.set(agent.id, Date.now() + INACTIVE_COOLDOWN_MS)
+          rt.warn('ds-bot: %s moveOn hit inactive context; cooling down %ds before retrying', agent.id, INACTIVE_COOLDOWN_MS / 1000)
+        }
+      })
       .finally(async () => {
         switches.delete(agent.id)
         if (job.moved) {
@@ -920,6 +934,8 @@ export function install(rt) {
     // window; waiting for check/4 more growth would overflow first). Below hard,
     // grown() still gates. Paired with A3 so the fresh part is born below hard.
     if (lines === undefined || tokens === undefined || tokens < lines.hard || readOnly()) return next()
+    // Batch5: in inactive cooldown, do not switch again on this turn.
+    if (Date.now() < (inactiveUntil.get(agent.id) ?? 0)) return next()
     if (await decide(agent, { midTurn: payload.step > 1 }) === 'compact' && await condense(agent, lines, { inTurn: true, signal: payload.signal })) return next()
     return switchBeforeStep(agent, payload, { hard: true })
   }, { prepend: true })
@@ -1033,6 +1049,7 @@ export function install(rt) {
     }
     if (tokens < lines.check || (tokens < lines.hard && !grown(agent.id, tokens, lines))) { checking.delete(agent.id); return }
     const hard = tokens >= lines.hard
+    if (Date.now() < (inactiveUntil.get(agent.id) ?? 0)) { checking.delete(agent.id); return }
     if (!hard && Date.now() < (noteFailures.get(agent.id)?.until ?? 0)) { checking.delete(agent.id); return }
     try {
       if (await decide(agent, { midTurn: false }) === 'compact') {

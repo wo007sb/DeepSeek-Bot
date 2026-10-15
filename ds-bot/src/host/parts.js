@@ -672,6 +672,11 @@ export function install(rt) {
   // it. A part makes room again only once it grew by a quarter of the check line past
   // it, so a large system prompt or a broken switch cannot make it act every turn.
   const partBase = new Map()
+  // Batch3: model key seen at the last pre-step per part. When quota forces a
+  // model switch (e.g. free model -> V41-Flash), the new model's window differs,
+  // so the same tokens can suddenly read as past the hard line. Without a
+  // re-baseline, pre-step switches immediately, then again on every turn.
+  const lastModel = new Map()
   // Parts whose note failed below the hard line: failures in a row, and the time
   // before which the check line does not try again.
   const noteFailures = new Map()
@@ -885,6 +890,22 @@ export function install(rt) {
       const now = tokensOf(agent.session)
       if (now !== undefined) partBase.set(agent.id, now)
     }
+    // Batch3: model just switched (quota -> new model). Re-baseline and do not
+    // switch on this turn: the new window needs one turn to settle, otherwise
+    // the same tokens read as past-hard under the new model and chain-switch.
+    try {
+      const route = agent.session.requestHeader?.()?.config
+      const modelKey = `${route?.provider ?? ''}:${route?.model ?? ''}`
+      const prev = lastModel.get(agent.id)
+      if (prev !== undefined && prev !== modelKey) {
+        lastModel.set(agent.id, modelKey)
+        const nowT = tokensOf(agent.session)
+        if (nowT !== undefined) partBase.set(agent.id, nowT)
+        rt.warn('ds-bot: model switched for %s (%s -> %s); re-baselining, not switching this turn', agent.id, prev, modelKey)
+        return next()
+      }
+      if (prev === undefined) lastModel.set(agent.id, modelKey)
+    } catch {}
     if (!readOnly() && await folderMove(agent, { midTurn: payload.step > 1 }) !== undefined) return switchBeforeStep(agent, payload, { folder: true })
     const lines = await contextLines(agent.session).catch(() => undefined)
     const tokens = tokensOf(agent.session)

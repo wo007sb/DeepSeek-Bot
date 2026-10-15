@@ -2,7 +2,7 @@
 // host on the same data from writing it, and the indexes that map a Session to the Bot
 // or group chat it belongs to.
 import { mkdirSync, statSync } from 'node:fs'
-import { copyFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { LEGACY_THEMES, MAX_EXCHANGES, ROOM_MODES } from './constants.js'
 import { homeLock } from './home-lock.js'
@@ -239,11 +239,15 @@ export function install(rt) {
     if (stopped) return writing
     indexSessions()
     // A reading host keeps the file's revision, so its window does not skip the next change.
-    if (!writable()) return writing
-    state.revision += 1
-    state.exchanges = state.exchanges.slice(-MAX_EXCHANGES)
-    const snapshot = JSON.stringify(state, null, 2)
+    // Do NOT silently succeed when not writable: callers must see the failure,
+    // otherwise the UI looks saved and the change vanishes on restart.
+    if (!writable()) return Promise.reject(new Error(readOnly() ?? 'state unreadable'))
     const run = writing.then(async () => {
+      // B-02: snapshot inside the write queue, so a change made while an earlier
+      // save waits is included in this save instead of being lost.
+      state.revision += 1
+      state.exchanges = state.exchanges.slice(-MAX_EXCHANGES)
+      const snapshot = JSON.stringify(state, null, 2)
       const temp = `${statePath}.${process.pid}.tmp`
       try {
         await mkdir(home, { recursive: true })
@@ -256,9 +260,16 @@ export function install(rt) {
           }
         }
         ensureLock()
-        await writeFile(temp, snapshot, 'utf8')
+        // B-01/B-29: fsync the temp file before rename, fsync the directory
+        // after rename, and keep the state file 0600 (it holds bot instructions
+        // and secret metadata). Without fsync a crash can leave a truncated
+        // state.json that load() then treats as an empty team.
+        const fh = await open(temp, 'w', 0o600)
+        try { await fh.writeFile(snapshot, 'utf8'); await fh.sync() } finally { await fh.close() }
         ensureLock()
         await rename(temp, statePath)
+        try { const dirFh = await open(home, 'r'); try { await dirFh.sync() } finally { await dirFh.close() } } catch {}
+        try { await chmod(statePath, 0o600) } catch {}
         seen = stamp()
         rt.capabilitiesStateSaved?.()
       } catch (error) {

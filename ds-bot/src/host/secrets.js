@@ -134,7 +134,12 @@ export function install(rt) {
       if (!loadedReadOnly) await chmod(path, 0o600).catch(() => {})
     } catch (error) {
       if (error?.code === 'ENOENT') secrets.clear()
-      else rt.warn('ds-bot: unreadable secrets file %s (%s)', path, reason(error))
+      else {
+        // B-13: keep a .broken-<ts> copy before discarding a corrupt file, so a
+        // bad write does not silently lose every secret.
+        try { const { copyFile } = await import('node:fs/promises'); await copyFile(path, `${path}.broken-${Date.now()}`) } catch {}
+        rt.warn('ds-bot: unreadable secrets file %s (%s)', path, reason(error))
+      }
     }
     changed()
   }

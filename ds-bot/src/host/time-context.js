@@ -5,14 +5,17 @@ const isClock = source => source?.kind === SOURCE || source?.kind === 'time-cont
 
 export function install(rt) {
   const { ctx, config } = rt
-  const interval = config.timeRefreshIntervalMs ?? 600_000
-  if (!Number.isSafeInteger(interval) || interval < 0) throw new TypeError('timeRefreshIntervalMs must be a non-negative safe integer')
-  const formatter = new Intl.DateTimeFormat('en-CA', {
-    ...(config.timeZone ? { timeZone: config.timeZone } : {}),
+  let interval = config.timeRefreshIntervalMs ?? 600_000
+  if (!Number.isSafeInteger(interval) || interval < 0) { rt.warn?.('ds-bot: bad timeRefreshIntervalMs, falling back to 600000'); interval = 600_000 }
+  let formatter
+  try {
+    formatter = new Intl.DateTimeFormat('en-CA', {
+      ...(config.timeZone ? { timeZone: config.timeZone } : {}),
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
     timeZoneName: 'longOffset',
-  })
+    })
+  } catch { rt.warn?.('ds-bot: bad timeZone, falling back to local zone'); formatter = new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZoneName: 'longOffset' }) }
   const zone = formatter.resolvedOptions().timeZone
 
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {

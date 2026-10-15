@@ -114,10 +114,15 @@ export function install(rt) {
           const parsed = new URL(url)
           if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error()
         } catch { throw new Error('Enter a valid HTTP or HTTPS URL.') }
-        Object.assign(item, { transport, url, headers: stringMap(body.headers, 'Headers'), approved: true })
+        const headers = stringMap(body.headers, 'Headers')
+        const changed = !previous || previous.kind !== 'mcp' || previous.transport !== 'streamable-http'
+          || previous.url !== url || !same(previous.headers ?? {}, headers)
+        Object.assign(item, { transport, url, headers, approved: ui ? true : changed ? false : previous.approved === true })
       }
     } else if (kind === 'skill') {
-      item.content = String(body.content ?? '').trim()
+      const content = String(body.content ?? '').trim().slice(0, 20000)
+      const changed = !previous || previous.kind !== 'skill' || previous.content !== content
+      Object.assign(item, { content, approved: ui ? true : changed ? false : previous.approved === true })
     } else {
       const names = [...new Set(strings(body.items))]
       for (const childName of names) {
@@ -275,7 +280,7 @@ export function install(rt) {
       await disposeMount(agentMounts.get(name))
       agentMounts.delete(name)
     }
-    if (item.kind === 'mcp' && item.transport === 'stdio' && item.approved !== true) {
+    if ((item.kind === 'mcp' || item.kind === 'skill') && item.approved !== true) {
       await drop()
       statusSet(bot.id, name, sessionId, { state: 'needs-approval' })
       return

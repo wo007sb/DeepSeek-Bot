@@ -33,6 +33,7 @@ export const STEWARD_SYSTEM = [
   '- "compact": the work is still under way. A task is half-done, the assistant is in the middle of its steps, the user and the assistant are still working on the same thing, or an answer or a result is still awaited. The older messages are condensed into a summary in place, and the work goes on without a break.',
   '',
   'Before you choose "switch", check each part of what the user asked against what the assistant actually did, and look for a question the assistant asked that the user has not answered. A part that was not done, even when the assistant says it is all done, or a question answered only with thanks or an acknowledgment, means the work is still under way.',
+  'Never choose "switch" when the user has only greeted you and has not asked for anything yet, or when the only new content since the last handoff is another handoff note with no new user message. A greeting with no task is not a stopping point; it is the start. In those cases return "compact".',
   '',
   'Each condensing loses some detail, and a summary of a summary loses more. So the more times this conversation has been condensed, the more a reasonable stopping point should count as one.',
   '',

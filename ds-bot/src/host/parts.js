@@ -525,6 +525,26 @@ export function install(rt) {
   async function decide(agent, { midTurn }) {
     if (engineOf(agent) === undefined) return 'switch'
     if (state.questions?.[agent.id] !== undefined) return 'compact'
+    // Batch2: break the greeting handoff chain. After a switch, the fresh part
+    // opens with a "[Handoff · part N]" user message. If that is still the latest
+    // user message and we are below the hard line, there is no new user work to
+    // switch for — switching again just writes another handoff note and chains
+    // forever (0 -> 1 -> 4 -> 7... on a bare "你好"). Stay in place.
+    try {
+      const dLines = await contextLines(agent.session).catch(() => undefined)
+      const dTokens = tokensOf(agent.session)
+      if (dLines !== undefined && dTokens !== undefined && dTokens < dLines.hard) {
+        const msgs = agent.session.deriveMessages?.() ?? []
+        const userMsgs = msgs.filter(m => m?.role === 'user')
+        const lastUser = userMsgs[userMsgs.length - 1]
+        const lastText = (Array.isArray(lastUser?.content) ? lastUser.content : []).filter(b => b?.type === 'text').map(b => b.text).join('\n')
+        if (lastText.includes('[Handoff') || lastText.includes('handoff')) {
+          rt.warn('ds-bot: latest user message is a handoff note with no new user work below the hard line; staying in place instead of switching')
+          return 'compact'
+        }
+      }
+    } catch {}
+
     try {
       const action = await askSteward(agent, { midTurn })
       if (action !== undefined) return action

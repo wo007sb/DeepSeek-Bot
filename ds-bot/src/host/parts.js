@@ -677,6 +677,13 @@ export function install(rt) {
   // so the same tokens can suddenly read as past the hard line. Without a
   // re-baseline, pre-step switches immediately, then again on every turn.
   const lastModel = new Map()
+  // Batch4: overflow streak per part. OVERFLOW bypasses decide(), so a part
+  // stuck at the window (128K stable, no new user work) would switch every
+  // ~22s forever. Count consecutive OVERFLOWs with no new user message; on
+  // the second one, stop switching and let the error surface instead of
+  // chaining another handoff part.
+  const overflowStreak = new Map()
+  const overflowUserCount = new Map()
   // Parts whose note failed below the hard line: failures in a row, and the time
   // before which the check line does not try again.
   const noteFailures = new Map()
@@ -984,6 +991,24 @@ export function install(rt) {
     // messages themselves break every request) must reach the terminal state,
     // not reset to 'carried' and loop forever.
     if (!rt.isBotSession(agent.id) || switches.has(agent.id) || readOnly() || rescued.get(agent.id) === 'bare') return next()
+    // Batch4: second consecutive OVERFLOW with no new user message => do not
+    // switch again. The fresh part would overflow on the same handoff content.
+    try {
+      const msgs = agent.session.deriveMessages?.() ?? []
+      const userCount = msgs.filter(m => m?.role === 'user').length
+      const prevCount = overflowUserCount.get(agent.id)
+      if (prevCount !== undefined && prevCount === userCount) {
+        const streak = (overflowStreak.get(agent.id) ?? 0) + 1
+        overflowStreak.set(agent.id, streak)
+        if (streak >= 1) {
+          rt.warn('ds-bot: OVERFLOW again with no new user message for %s; not switching to avoid the loop (streak %d)', agent.id, streak + 1)
+          return next()
+        }
+      } else {
+        overflowStreak.set(agent.id, 0)
+        overflowUserCount.set(agent.id, userCount)
+      }
+    } catch {}
     const entry = rt.liveOf(agent.id)
     entry.switched = true
     startSwitch(agent, { resume: true, info: entry.info, joined: [...(entry.joined ?? [])], overflow: true, bare: rescued.get(agent.id) === 'carried' })
